@@ -153,12 +153,16 @@ function makePiece(type, color) {
   });
   if (src.clips?.length) {
     const mixer = new THREE.AnimationMixer(obj);
-    const action = mixer.clipAction(src.clips[0]);
-    action.play();
+    const acts = {};
+    src.clips.forEach(c => { acts[c.name] = mixer.clipAction(c); });
+    const idle = acts.Idle || mixer.clipAction(src.clips[0]);
+    idle.play();
     // desync every piece, or 32 figures breathe as one organism
-    action.time = Math.random() * src.clips[0].duration;
+    idle.time = Math.random() * idle.getClip().duration;
     mixer.timeScale = 0.85 + Math.random() * 0.3;
     mixers.push(mixer);
+    obj.userData.mixer = mixer;
+    obj.userData.acts = acts;
   }
   return obj;
 }
@@ -304,17 +308,57 @@ function onClick(e) {
   showHints();
 }
 
+// walk the piece across the board instead of teleporting it
+const travelling = [];
+function walkPiece(from, to, done) {
+  const piece = pieceGroup.children.find(p => p.userData.square === from);
+  if (!piece) { done(); return; }
+  const a = squareToPos(from), b = squareToPos(to);
+  const acts = piece.userData.acts;
+  const baseRot = piece.rotation.y;
+  piece.rotation.y = Math.atan2(b.x - a.x, b.z - a.z);   // face where it's going
+  if (acts?.Walk) {
+    acts.Walk.reset().play();
+    acts.Idle?.crossFadeTo(acts.Walk, 0.15, false);
+  }
+  travelling.push({ piece, a, b, t: 0, dur: 0.5 + a.distanceTo(b) * 0.2, baseRot, acts, done });
+}
+
+function stepTravel(dt) {
+  for (let i = travelling.length - 1; i >= 0; i--) {
+    const w = travelling[i];
+    w.t += dt;
+    const k = Math.min(w.t / w.dur, 1);
+    w.piece.position.lerpVectors(w.a, w.b, k);
+    if (k >= 1) {
+      if (w.acts?.Idle) {
+        w.acts.Idle.reset().play();          // crossFadeTo needs the target already running
+        w.acts.Walk?.crossFadeTo(w.acts.Idle, 0.2, false);
+      }
+      w.piece.rotation.y = w.baseRot;
+      travelling.splice(i, 1);
+      w.done();
+    }
+  }
+}
+
 function playMove(m) {
-  game.move({ from: m.from, to: m.to, promotion: 'q' });
-  selected = null; legal = []; showHints(); renderPieces(); updateStatus();
-  if (game.isGameOver()) return;
   busy = true;
-  setTimeout(() => {
-    const reply = bestMove(game, aiDepth);
-    if (reply) game.move(reply);
-    busy = false;
+  selected = null; legal = []; showHints();
+  walkPiece(m.from, m.to, () => {
+    game.move({ from: m.from, to: m.to, promotion: 'q' });
     renderPieces(); updateStatus();
-  }, 60); // let the DOM paint "thinking" before we block on search
+    if (game.isGameOver()) { busy = false; updateStatus(); return; }
+    setTimeout(() => {                       // let the DOM paint before the search blocks
+      const reply = bestMove(game, aiDepth);
+      if (!reply) { busy = false; updateStatus(); return; }
+      walkPiece(reply.from, reply.to, () => {
+        game.move(reply);
+        busy = false;
+        renderPieces(); updateStatus();
+      });
+    }, 60);
+  });
 }
 
 // ---------- UI ----------
@@ -389,6 +433,7 @@ const clock = new THREE.Clock();
 renderer.setAnimationLoop(() => {
   const dt = clock.getDelta();
   mixers.forEach(m => m.update(dt));
+  stepTravel(dt);
   controls.update();
   renderer.render(scene, camera);
 });
